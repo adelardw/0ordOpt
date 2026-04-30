@@ -62,13 +62,15 @@ class ZeroOrderOptimizer:
     def __init__(
         self,
         model: nn.Module,
-        lr: float = 1e-3,
-        eps: float = 1e-3,
-        perturbation_mode: str = "gaussian",
+        gamma: float = 0.9,
+        lr: float = 1e-2,
+        eps: float = 1e-2,
+        perturbation_mode: str = "uniform",
     ) -> None:
         self.model = model
         self.lr = lr
         self.eps = eps
+        self.gamma = gamma
 
         if perturbation_mode not in ("gaussian", "uniform"):
             raise ValueError(
@@ -87,7 +89,10 @@ class ZeroOrderOptimizer:
         # You can also update self.layer_names inside .step() to implement
         # a dynamic schedule (e.g. gradually unfreeze deeper layers).
         # ------------------------------------------------------------------
-        self.layer_names: list[str] = ["fc.weight", "fc.bias"]
+        self.layer_names: list[str] = [
+            n for n, _ in model.named_parameters()
+            if n.startswith("layer4") or n.startswith("fc")
+        ]
         # ------------------------------------------------------------------
 
     # ------------------------------------------------------------------
@@ -174,25 +179,42 @@ class ZeroOrderOptimizer:
         grads: dict[str, torch.Tensor] = {}
 
         with torch.no_grad():
+
+            fparams = [p.data.flatten() for n,p in params.items()]
+            flatten_params = torch.cat(fparams)
+            u_flat = self._sample_direction(flatten_params)
+
+            u_slices: dict[str, torch.Tensor] = {}
+            offset = 0
             for name, param in params.items():
-                u = self._sample_direction(param)
+                n = param.numel()
+                u_slices[name] = u_flat[offset:offset + n].view(param.shape)
+                offset += n
 
-                # f(x + eps * u)
-                param.data.add_(self.eps * u)
-                f_plus = loss_fn()
+            for name, param in params.items():
+                param.data.add_(self.eps * u_slices[name])
 
-                # f(x - eps * u)  — restore then subtract
-                param.data.sub_(2.0 * self.eps * u)
-                f_minus = loss_fn()
+            f_plus = loss_fn()
+            for name, param in params.items():
+                param.data.sub_(2.0 * self.eps * u_slices[name])
+            f_minus = loss_fn()
 
-                # Restore original value
-                param.data.add_(self.eps * u)
+            for name, param in params.items():
+                param.data.add_(self.eps * u_slices[name])
 
-                grad_estimate = ((f_plus - f_minus) / (2.0 * self.eps)) * u
-                grads[name] = grad_estimate
+            grad_ = (f_plus - f_minus) / (2.0 * self.eps)
+            for name in params:
+                grads[name] = grad_ * u_slices[name]
 
         return grads
-        # ------------------------------------------------------------------
+
+    def _init_velocity(self, grads: dict[str, torch.Tensor]):
+        if hasattr(self, 'v'):
+            return self.v
+        else:
+            self.v: dict[str, torch.Tensor] = {}
+            for name, gr in grads.items():
+                self.v[name] = torch.zeros_like(gr)
 
     def _update_params(
         self,
@@ -218,9 +240,11 @@ class ZeroOrderOptimizer:
         # ------------------------------------------------------------------
         # STUDENT: Replace or extend the parameter update below.
         # ------------------------------------------------------------------
+        self._init_velocity(grads)
         with torch.no_grad():
             for name, param in params.items():
-                param.data.sub_(self.lr * grads[name])
+                self.v[name] = self.gamma * self.v[name] + self.lr * torch.clip(grads[name], -1.0, 1.0)
+                param.data.sub_(self.v[name])
         # ------------------------------------------------------------------
 
     # ------------------------------------------------------------------
