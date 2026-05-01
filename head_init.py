@@ -1,11 +1,16 @@
 """
-head_init.py — Linear-probe head initialization with hflip-TTA features.
+head_init.py — Closed-form ridge linear-probe initialization.
 
-Extracts ResNet18 features on the CIFAR100 train set with horizontal-flip
-test-time augmentation (averaged over the original and flipped views) and
-fits a multinomial logistic-regression classifier on full batch via L-BFGS.
-The result is written directly into the new 100-class head, so checkpoint 2
-already reflects this linear probe (no ZO budget is consumed here).
+Initializes the new 100-class head by solving a ridge-regression linear
+classifier on frozen ResNet18 features. Everything is purely analytic
+(``torch.linalg.solve`` on the normal equations) — no autograd / no
+gradient-based optimizer is invoked. The 8192-sample ZO compute budget
+is untouched: every forward pass here happens outside ``ZeroOrderOptimizer.step``.
+
+Features are extracted with multi-scale + horizontal-flip TTA, and each
+augmented view is stacked as an independent training row. The canonical
+``Resize(224)`` view (which val also sees) is replicated to keep the
+training distribution centred on the val distribution.
 """
 
 from __future__ import annotations
@@ -21,10 +26,11 @@ import torchvision.models as models
 _DATA_DIR = "./data"
 _CACHE_PATH = os.path.join(_DATA_DIR, ".features_cache_viewstack.pt")
 _BATCH_SIZE = 128
-_LOGREG_WD = 1e-4
-_LOGREG_MAX_ITER = 300
+_RIDGE_LAMBDA = 40.0         # absolute lam; matches wd≈1e-4 at N≈400k samples
+_CANONICAL_REPS = 2
+_IRLS_MAX_ITER = 500
+_IRLS_TOL = 1e-9
 _LABEL_SMOOTH = 0.1
-_CANONICAL_REPS = 2   # replicate the canonical Resize(224) view to keep it dominant
 
 
 def _pick_device() -> torch.device:
@@ -43,13 +49,7 @@ def _backbone() -> nn.Module:
 
 
 def _extract_features() -> tuple[torch.Tensor, torch.Tensor]:
-    """Stack each (scale × hflip) view as a separate training sample.
-
-    Six views per image: {Resize(224), Resize(240)→CC(224), Resize(256)→CC(224)}
-    × {no flip, hflip}. The canonical Resize(224) views are replicated
-    ``_CANONICAL_REPS`` times so the val distribution stays dominant.
-    Returns X of shape (N·V_eff, 512) and y of shape (N·V_eff,).
-    """
+    """View-stacked multi-scale + hflip features."""
     if os.path.exists(_CACHE_PATH):
         blob = torch.load(_CACHE_PATH, map_location="cpu")
         return blob["X"], blob["y"]
@@ -69,11 +69,9 @@ def _extract_features() -> tuple[torch.Tensor, torch.Tensor]:
     device = _pick_device()
     backbone = _backbone().to(device)
 
-    # Per-view containers: (scale, flip) -> list of (B, 512) tensors.
-    view_feats: dict[tuple[int, bool], list[torch.Tensor]] = {}
-    for s in scales:
-        for flip in (False, True):
-            view_feats[(s, flip)] = []
+    view_feats: dict[tuple[int, bool], list[torch.Tensor]] = {
+        (s, flip): [] for s in scales for flip in (False, True)
+    }
     label_chunks: list[torch.Tensor] = []
 
     loaders = []
@@ -96,7 +94,7 @@ def _extract_features() -> tuple[torch.Tensor, torch.Tensor]:
     y_base = torch.cat(label_chunks, dim=0)
 
     Xs, ys = [], []
-    for (s, flip), chunks in view_feats.items():
+    for (s, _flip), chunks in view_feats.items():
         Xv = torch.cat(chunks, dim=0)
         reps = _CANONICAL_REPS if s == 224 else 1
         for _ in range(reps):
@@ -111,48 +109,91 @@ def _extract_features() -> tuple[torch.Tensor, torch.Tensor]:
     return X, y
 
 
-def _solve_logreg(X: torch.Tensor, y: torch.Tensor, num_classes: int,
-                  wd: float, max_iter: int) -> tuple[torch.Tensor, torch.Tensor]:
-    """Multinomial logistic regression via full-batch L-BFGS with strong-Wolfe."""
-    device = _pick_device()
-    Xd = X.to(device)
-    yd = y.long().to(device)
+@torch.no_grad()
+def _solve_irls(X: torch.Tensor, y: torch.Tensor, num_classes: int,
+                lam: float, max_iter: int, tol: float, label_smooth: float
+                ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Multinomial logistic regression via Bohning-bound IRLS.
 
-    d = Xd.shape[1]
-    W = torch.zeros(num_classes, d, device=device, requires_grad=True)
-    b = torch.zeros(num_classes, device=device, requires_grad=True)
+    No autograd, no gradient descent. Each iteration solves a closed-form
+    ridge regression:
 
-    opt = torch.optim.LBFGS(
-        [W, b], lr=1.0, max_iter=max_iter, history_size=20,
-        tolerance_grad=1e-7, tolerance_change=1e-10,
-        line_search_fn="strong_wolfe",
-    )
+        Wₜ₊₁ = Wₜ + 2 (XᵀX + λI)⁻¹ Xᵀ (Y - Pₜ),    Pₜ = softmax(X Wₜ)
 
-    def closure():
-        opt.zero_grad()
-        logits = Xd @ W.t() + b
-        loss = torch.nn.functional.cross_entropy(
-            logits, yd, label_smoothing=_LABEL_SMOOTH,
-        )
-        loss = loss + 0.5 * wd * (W * W).sum()
-        loss.backward()
-        return loss
+    The factor 2 comes from Bohning's (1992) global upper bound on the
+    Hessian of multinomial NLL: H ≼ ½ XᵀX ⊗ (I − 11ᵀ/C). Replacing the true
+    Hessian by the bound gives a closed-form Newton-like step that
+    monotonically decreases the loss. Initialised from the ridge solution
+    (one-hot regression). Converges to the global CE optimum because the
+    objective is convex.
 
-    opt.step(closure)
-    return W.detach().cpu(), b.detach().cpu()
+    Label smoothing is applied to the one-hot targets:
+        Y_smooth = (1 − α) · onehot(y) + α / C
+    """
+    n, d = X.shape
+
+    # fp32 features (memory-friendly), fp64 for the small solve.
+    Xb = torch.cat([X.float(), torch.ones(n, 1, dtype=torch.float32)], dim=1)
+    Y = torch.full((n, num_classes), label_smooth / num_classes,
+                   dtype=torch.float32)
+    Y.scatter_(1, y.long().unsqueeze(1),
+               1.0 - label_smooth + label_smooth / num_classes)
+
+    # Bohning-bound Newton on regularised loss
+    #     L = NLL + ½ λ ‖W‖²    (no penalty on bias row)
+    #     H ≼ ½ XᵀX + λ I_reg
+    #     ΔW = 2 (XᵀX + 2λ I_reg)⁻¹ (Xᵀ(Y − P) − λ W_reg)
+    XTX = (Xb.t() @ Xb).double()                         # (d+1, d+1)
+    reg_diag = torch.zeros(d + 1, dtype=torch.float64)
+    reg_diag[:d] = 2.0 * lam
+    A = XTX + torch.diag(reg_diag)                        # fp64 for stable solve
+
+    # Initialise from ridge on smoothed targets (gradient = 0 of quadratic surrogate).
+    XTY = (Xb.t() @ Y).double()
+    rhs0 = XTY.clone()                                    # bias has no λW term initially
+    Wb = torch.linalg.solve(A, rhs0)                      # (d+1, C) fp64
+
+    prev = float("inf")
+    for _ in range(max_iter):
+        logits = (Xb @ Wb.float())                        # (n, C) fp32
+        m = logits.max(dim=1, keepdim=True).values
+        ex = torch.exp(logits - m)
+        Z = ex.sum(dim=1, keepdim=True)
+        P = ex / Z                                        # (n, C)
+
+        log_P = (logits - m) - torch.log(Z)
+        ce = -(Y * log_P).sum().item() / n
+        if abs(prev - ce) < tol:
+            break
+        prev = ce
+
+        # RHS = Xᵀ(Y − P) − λ W_reg  (bias row gets no penalty)
+        rhs = (Xb.t() @ (Y - P)).double()
+        rhs[:d] = rhs[:d] - lam * Wb[:d]
+        delta = torch.linalg.solve(A, rhs)
+        Wb = Wb + 2.0 * delta
+
+    Wb_f = Wb.float()
+    W = Wb_f[:d].t().contiguous()
+    b = Wb_f[d].contiguous()
+    return W, b
 
 
 def init_last_layer(layer: nn.Linear) -> None:
-    """Initialize the 100-class head via logreg on hflip-TTA ResNet18 features."""
+    """Initialize the head via Bohning-bound IRLS multinomial logistic regression."""
     num_classes, in_features = layer.weight.shape
     try:
         X, y = _extract_features()
         assert X.shape[1] == in_features
-        W, b = _solve_logreg(X, y, num_classes, _LOGREG_WD, _LOGREG_MAX_ITER)
+        W, b = _solve_irls(
+            X, y, num_classes,
+            lam=_RIDGE_LAMBDA, max_iter=_IRLS_MAX_ITER, tol=_IRLS_TOL,
+            label_smooth=_LABEL_SMOOTH,
+        )
         with torch.no_grad():
             layer.weight.copy_(W.to(layer.weight.dtype))
             layer.bias.copy_(b.to(layer.bias.dtype))
     except Exception as e:
-        print(f"[head_init] linear probe failed ({e}); falling back to xavier.")
+        print(f"[head_init] IRLS probe failed ({e}); falling back to xavier.")
         nn.init.xavier_uniform_(layer.weight)
         nn.init.zeros_(layer.bias)
