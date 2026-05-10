@@ -170,6 +170,7 @@ cython_debug/
 data/
 *.csv
 *.json
+!results.json
 *.pkl
 *.pickle
 *.h5
@@ -209,7 +210,7 @@ Thumbs.db
 
 # Project specific ignores (based on your directory structure)
 torchenv/  # If this is a virtual environment directory
-results.json  # If this contains temporary results
+# results.json is tracked (required submission file)
 __pycache__/  # Already covered, but being explicit
 
 # Keep data directory but ignore contents (uncomment if you want to track empty directory)
