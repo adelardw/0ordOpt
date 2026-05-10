@@ -133,7 +133,7 @@ class ZeroOrderOptimizer:
         """
         if self.perturbation_mode == "gaussian":
             u = torch.randn_like(param)
-        else:  # uniform
+        else:
             u = torch.rand_like(param) * 2.0 - 1.0
 
         norm = u.norm()
@@ -173,9 +173,6 @@ class ZeroOrderOptimizer:
         Student task:
             Replace this with a more efficient or accurate estimator:
         """
-        # ------------------------------------------------------------------
-        # STUDENT: Replace or extend the gradient estimation below.
-        # ------------------------------------------------------------------
         grads: dict[str, torch.Tensor] = {}
 
         with torch.no_grad():
@@ -237,19 +234,12 @@ class ZeroOrderOptimizer:
               - Adam-style: maintain first and second moment estimates.
               - Clipped update: ``p ← p - lr * clip(grad, max_norm)``.
         """
-        # ------------------------------------------------------------------
-        # STUDENT: Replace or extend the parameter update below.
-        # ------------------------------------------------------------------
+
         self._init_velocity(grads)
         with torch.no_grad():
             for name, param in params.items():
                 self.v[name] = self.gamma * self.v[name] + self.lr * torch.clip(grads[name], -1.0, 1.0)
                 param.data.sub_(self.v[name])
-        # ------------------------------------------------------------------
-
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
 
     def step(self, loss_fn: Callable[[], float]) -> float:
         """Perform one zero-order optimisation step.
@@ -276,7 +266,6 @@ class ZeroOrderOptimizer:
         """
         params = self._active_params()
 
-        # Record the loss before any perturbation.
         with torch.no_grad():
             loss_before = loss_fn()
 
