@@ -94,9 +94,13 @@ def solve_approximate(X: torch.Tensor, y: torch.Tensor, num_classes: int,
                       label_smooth: float) -> tuple[torch.Tensor, torch.Tensor]:
 
     '''
-    At the optimum of softmax CE: X.T (sigmoid(Xw) - y) = 0
-    Approximating sigmoid(Xw) ≈ y gives normal equations:
-    (X.T X) w = X.T logit(y)  =>  w = (X.T X)^-1 X.T ln(y / (1 - y))
+    Fixed-point approximation: at the optimum of per-class sigmoid BCE,
+    X.T (sigmoid(Xw) - y) = 0.  Substituting sigmoid(Xw) = y (i.e. treating
+    the predictions as already equal to the targets) gives:
+        Xw = logit(y)  =>  w = (X.T X)^-1 X.T logit(y)
+    This is NOT a Taylor expansion around Xw=0; it is a least-squares solve
+    for the fixed-point equation.  The per-class sigmoid formulation is
+    a multi-label surrogate, not multinomial softmax-CE.
     '''
     n, d = X.shape
 
@@ -162,25 +166,24 @@ def solve_hessian_newton(
     label_smooth: float,
     lam: float = _RIDGE_LAMBDA,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """One exact Newton step from ridge init, using per-class diagonal Hessian.
+    """One Newton step for softmax-CE, warm-started from the sigmoid-ridge solution.
 
-    solve_approximate_ridge uses a global curvature scalar sigmoid'(0)=0.25.
-    Here we compute the actual per-class Hessian weight at the ridge solution:
+    Note on mixed objectives: the warm-start (solve_approximate_ridge) minimises
+    a per-class sigmoid BCE surrogate with curvature constant σ'(0)=0.25.
+    The Newton step here is taken for the *multinomial softmax-CE* objective —
+    a different loss.  The gain over ridge (+0.18 pp) is therefore not simply
+    "replacing 0.25 with the true curvature of the same loss"; it is a single
+    Newton step of softmax-CE from a point optimised for a different surrogate.
+
+    Per-class diagonal Hessian of softmax-CE at the ridge point:
 
         s_c = (1/n) Σ_i  p_{ic}(1 − p_{ic}),   P = softmax(X W_ridge)
 
-    The Newton update for class c is then:
+    Newton update for class c:
 
         w_c ← w_c + (s_c · XᵀX + λI)⁻¹ [Xᵀ(y_c − p_c) − λ w_c]
 
-    All C systems share the same XᵀX and are solved in one batched call:
-
-        A  ∈ ℝ^{C × (d+1) × (d+1)},   A_c = s_c · XᵀX + diag(λ, …, λ, 0)
-        rhs ∈ ℝ^{C × (d+1)}
-
-    Cost: one ridge solve (warm start) + one softmax pass + one batched LU.
-    Converges faster than the 0.25-flat approximation when the head is far from
-    the decision boundary (high confidence → large s_c variance across classes).
+    All C systems share the same XᵀX and are solved in one batched LU call.
     """
     n, d = X.shape
 
