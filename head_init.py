@@ -19,6 +19,7 @@ import os
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torchvision.datasets as datasets
 import torchvision.models as models
 import torchvision.transforms as T
@@ -26,10 +27,10 @@ from augmentation import _CIFAR100_MEAN, _CIFAR100_STD
 
 _DATA_DIR = "./data"
 _CACHE_PATH = os.path.join(_DATA_DIR, ".features_cache_viewstack.pt")
-_BATCH_SIZE = 128
-_RIDGE_LAMBDA = 40.0
+_BATCH_SIZE = 512
+_RIDGE_LAMBDA = 30.0
 _CANONICAL_REPS = 2
-_IRLS_MAX_ITER = 500
+_IRLS_MAX_ITER = 200
 _IRLS_TOL = 1e-9
 _LABEL_SMOOTH = 0.1
 
@@ -55,51 +56,33 @@ def _extract_features() -> tuple[torch.Tensor, torch.Tensor]:
 
 
 
-    def _mk(resize: int) -> T.Compose:
-        if resize == 224:
-            return T.Compose([T.Resize(224), T.ToTensor(), T.Normalize(_CIFAR100_MEAN, _CIFAR100_STD)])
-        return T.Compose([T.Resize(resize), T.CenterCrop(224),
-                          T.ToTensor(), T.Normalize(_CIFAR100_MEAN, _CIFAR100_STD)])
-
-    scales = (224, 240, 256)
-
     device = get_device()
     backbone = get_backbone().to(device)
 
-    view_feats: dict[tuple[int, bool], list[torch.Tensor]] = {
-        (s, flip): [] for s in scales for flip in (False, True)
-    }
-    label_chunks: list[torch.Tensor] = []
+    mean = torch.tensor(_CIFAR100_MEAN, device=device).view(1, 3, 1, 1)
+    std  = torch.tensor(_CIFAR100_STD,  device=device).view(1, 3, 1, 1)
 
-    loaders = []
-    for s in scales:
-        ds = datasets.CIFAR100(root=_DATA_DIR, train=True, download=True, transform=_mk(s))
-        loaders.append(torch.utils.data.DataLoader(
-            ds, batch_size=_BATCH_SIZE, shuffle=False, num_workers=0,
-        ))
+    # Load entire CIFAR-100 train into RAM (50k×3×32×32 ≈ 600 MB)
+    ds = datasets.CIFAR100(root=_DATA_DIR, train=True, download=True)
+    all_imgs = torch.from_numpy(ds.data).permute(0, 3, 1, 2).float() / 255.0  # (50k,3,32,32)
+    y_base   = torch.tensor(ds.targets)  # (50k,)
 
+    feats_normal, feats_flip = [], []
     with torch.no_grad():
-        for batch_tuple in zip(*loaders):
-            label_chunks.append(batch_tuple[0][1])
-            for s, (imgs, _) in zip(scales, batch_tuple):
-                imgs = imgs.to(device, non_blocking=True)
-                view_feats[(s, False)].append(backbone(imgs).float().cpu())
-                view_feats[(s, True)].append(
-                    backbone(torch.flip(imgs, dims=[3])).float().cpu()
-                )
+        for start in range(0, len(all_imgs), _BATCH_SIZE):
+            imgs = all_imgs[start:start + _BATCH_SIZE].to(device)
+            up = F.interpolate(imgs, size=224, mode="bilinear", align_corners=False)
+            up = (up - mean) / std
+            both = torch.cat([up, torch.flip(up, dims=[3])], dim=0)
+            feats = backbone(both).float().cpu()
+            half = feats.shape[0] // 2
+            feats_normal.append(feats[:half])
+            feats_flip.append(feats[half:])
 
-    y_base = torch.cat(label_chunks, dim=0)
-
-    Xs, ys = [], []
-    for (s, _flip), chunks in view_feats.items():
-        Xv = torch.cat(chunks, dim=0)
-        reps = _CANONICAL_REPS if s == 224 else 1
-        for _ in range(reps):
-            Xs.append(Xv)
-            ys.append(y_base)
-
-    X = torch.cat(Xs, dim=0)
-    y = torch.cat(ys, dim=0)
+    Xn = torch.cat(feats_normal, dim=0)
+    Xf = torch.cat(feats_flip,   dim=0)
+    X = torch.cat([Xn] * _CANONICAL_REPS + [Xf], dim=0)
+    y = y_base.repeat(_CANONICAL_REPS + 1)
 
     os.makedirs(_DATA_DIR, exist_ok=True)
     torch.save({"X": X, "y": y}, _CACHE_PATH)
