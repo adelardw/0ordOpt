@@ -10,7 +10,6 @@ input expected by the pretrained ResNet18 backbone.
 
 import torchvision.transforms as T
 
-# Per-channel mean and std computed on the CIFAR100 training set.
 _CIFAR100_MEAN = (0.5071, 0.4867, 0.4408)
 _CIFAR100_STD = (0.2675, 0.2565, 0.2761)
 
